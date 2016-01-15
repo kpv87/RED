@@ -1,0 +1,2204 @@
+CREATE OR REPLACE PACKAGE BODY PUB_DS.f_sap_salebook_monthly_upl
+IS
+  PROCEDURE partition_create (in_tale_name IN varchar2, in_partition_name IN varchar2, in_month_date IN varchar2) IS
+    i NUMBER;
+  BEGIN
+    SELECT COUNT ( * )
+    INTO i
+    FROM user_tab_partitions
+    WHERE table_name = upper(in_tale_name) AND
+          partition_name LIKE upper(in_partition_name || '_' ) || to_char(to_date(in_month_date,'YYYYMMDD'),'YYYYMM');
+
+    IF i = 0 THEN
+      EXECUTE IMMEDIATE   'alter table '|| in_tale_name || ' add partition ' || in_partition_name || '_'
+                       || to_char(to_date(in_month_date,'YYYYMMDD'),'YYYYMM')
+                       || ' values (TO_DATE('''
+                       || in_month_date
+                       || ''', ''YYYYMMDD''))';
+    END IF;
+
+        pub_ds.job_log.write_detail_log(in_comment_text => 'partition_create');
+  END;
+
+
+  PROCEDURE partition_move (in_month_date IN VARCHAR2) IS
+  BEGIN
+    EXECUTE IMMEDIATE 'alter table F_SAP_CLNT_SALES_MONTHLY_TMP move compress for query high parallel 8';
+
+    EXECUTE IMMEDIATE   'alter table f_clnt_salebook_monthly exchange partition SAP_CL_SALEBOOK_'
+                     || to_char(to_date(in_month_date,'YYYYMMDD'),'YYYYMM')
+                         || ' with table F_SAP_CLNT_SALES_MONTHLY_TMP';
+
+
+        --EXECUTE IMMEDIATE 'alter table f_clnt_salebook_monthly move partition SAP_CL_SALEBOOK_' || to_char(to_date(in_month_date,'YYYYMMDD'),'YYYYMM') || ' compress';
+
+    pub_ds.job_log.write_detail_log(in_comment_text => 'partition_move');
+  END;
+
+-- Загружаем список клиентов-исключенцев
+/*
+Выглядит некрасиво, но работает быстро
+*/
+procedure load_exceptions(filial_id_ number, ed_ date, cd_ date)
+is
+    r_ number;
+begin
+    pub_ds.job_log.write_detail_log('start load exceptions');
+
+    execute immediate 'truncate table F_SAP_SALES_EX_TMP';
+    insert into F_SAP_SALES_EX_TMP(Clnt_Clnt_Id)
+        select /*+parallel(8) use_concat*/ distinct
+            c.CLNT_CLNT_ID
+        from
+            s_clients c
+        where
+            c.snap_date = cd_
+        and c.FILIAL_ID = nvl(filial_id_, c.FILIAL_ID)
+        and exists (
+                select
+                    1
+                from
+                    m_sap_clients_exception ex
+                where
+                    nvl(ex.direction, 0) = 0
+                and ex.DETG_ID is null
+                and (
+                        ex.clnt_id = c.clnt_clnt_id
+                        or
+                        ex.brnc_id = c.brnc_brnc_id
+                        or
+                        ex.ctyp_id = c.ctyp_ctyp_id
+                     )
+                and ex.start_date < ed_  and ex.end_date >= ed_
+        )
+        ;
+    r_ := sql%rowcount;
+    commit;
+    pub_ds.job_log.write_detail_log('end load exceptions', r_);
+end;
+
+  PROCEDURE load_data_fucturies (in_filial_id IN NUMBER, in_month_date IN date) IS
+        v_sdate varchar2(8);
+    r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+        EXECUTE IMMEDIATE 'truncate table f_salebook_monthly_fuct_tmp';
+
+        insert /*+ append parallel(8)*/
+        into f_salebook_monthly_fuct_tmp
+        (
+        CLNT_CLNT_ID,
+        AMOUNT,
+        VAT
+        )
+        select /*+ dynamic_sampling(f 6) parallel(8)*/
+            f.clnt_clnt_id,
+            sum(f.amount) amount,
+            sum(f.vat) vat
+        from bis_fucturies f,
+             s_clients sc
+        where
+               f.fttp_fttp_id not in (3,9)
+           and f.fuct_date >= trunc(in_month_date,'MM')
+           and f.fuct_date< add_months(trunc(in_month_date,'mm'),1)
+           and f.del_date is null
+           and sc.clnt_clnt_id=f.clnt_clnt_id
+           and sc.FILIAL_ID = nvl(in_filial_id, sc.FILIAL_ID)
+           and sc.snap_date=last_day(in_month_date)
+           and sc.master_segment_id > 0
+           and not exists
+           (
+           select 1
+           from
+               m_sap_clients_exception sce1
+           where
+               --sce1.filial_id=in_filial_id
+                   sce1.direction=0
+               and sce1.clnt_id=sc.clnt_clnt_id
+               and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+               and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+           )
+           and not exists
+           (
+           select 1
+           from
+               m_sap_clients_exception sce1
+           where
+               --sce1.filial_id=in_filial_id
+                   sce1.direction=0
+               and sce1.brnc_id = sc.brnc_brnc_id
+               and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+               and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+           )
+           and not exists
+           (
+           select 1
+           from
+               m_sap_clients_exception sce1
+           where
+               --sce1.filial_id=in_filial_id
+                   sce1.direction=0
+               and sce1.ctyp_id=sc.ctyp_ctyp_id
+               and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+               and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+           )
+        group by f.clnt_clnt_id
+        ;
+
+        r := sql%ROWCOUNT;
+        commit;
+
+       pub_ds.job_log.write_detail_log(in_comment_text => 'load_data_fucturies',in_rows_processed => r);
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_data_fucturies: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+
+
+  PROCEDURE load_data_bills (in_filial_id IN NUMBER, in_month_date IN date) IS
+        v_sdate varchar2(8);
+    r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+        EXECUTE IMMEDIATE 'truncate table F_SAP_CLNT_SALES_MONTHLY_TMP';
+
+      INSERT /*+ append parallel(8)*/ INTO F_SAP_CLNT_SALES_MONTHLY_TMP
+        (
+        BILL_MONTH,
+        BILL_DATE,
+        FILIAL_ID,
+        CLNT_CLNT_ID,
+        BRNC_ID,
+        JRTP_ID,
+        DIVN_ID,
+        AMOUNT_ALL,
+        VAT,
+        AMOUNT,
+        DETG_ID,
+        BSEG_ID,
+        CTYP_ID,
+        FS_FS_ID,
+        ACC_ACC_ID,
+        STAT_CODE,
+        ACOUNT_TYPE,
+        IS_VAT,
+        SAP_CLNT_ID,
+        BSTP_ID,
+        PRCL_ID,
+        CNT_TO,
+        CCAT_ID,
+        CLCL_ID,
+        BILL_ID,
+        AJMT_ID,
+        FUCT_ID,
+        FUCT_DATE,
+        IS_UPLOADING2SAP
+    )
+
+      select /*+ dynamic_sampling(b 6) parallel(8)*/
+          trunc(in_month_date,'MM') BILL_MONTH,
+          --b.bill_date BILL_DATE,
+          last_day(in_month_date) BILL_DATE,
+          sc.FILIAL_ID,
+          sc.clnt_clnt_id,
+          sc.brnc_brnc_id,
+          sc.jrtp_jrtp_id,
+          nvl(bt.divn_divn_id, 1) divn_id,
+          sum(nvl(bd.amount_r,0)) amount_all,
+          sum(nvl(bd.vat_r,0)) vat,
+          sum(nvl(bd.amount_r,0) - nvl(bd.vat_r,0)) amount,
+          bd.detg_detg_id,
+          sc.bseg_bseg_id,
+          sc.ctyp_ctyp_id,
+         (
+          select --+index(DFS IU_M_SAP_DETG_FS_ACC)
+                max(dfs.o_fs_id ) keep (dense_rank first order by dfs.i_ctyp_ctyp_id, dfs.i_bstp_id)
+          from
+              m_sap_detg_fs_acc dfs
+          where
+           dfs.i_detg_detg_id = bd.detg_detg_id
+           and nvl(dfs.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+           and nvl(dfs.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+           --and dfs.filial_id = in_filial_id
+           and dfs.start_date<=last_day(in_month_date)
+           and dfs.end_date>=last_day(in_month_date)
+         ) FS_FS_ID,
+         (
+          select --+index(DACC IU_M_SAP_DETG_FS_ACC)
+          max (dacc.o_acc_id) KEEP (DENSE_RANK first ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+          from
+                m_sap_detg_fs_acc dacc
+          where
+          dacc.i_detg_detg_id = bd.detg_detg_id
+          and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+          and nvl(dacc.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+          --and dacc.filial_id = in_filial_id
+          and dacc.start_date<=last_day(in_month_date)
+          and dacc.end_date>=last_day(in_month_date)
+         ) acc_acc_id,
+         (
+          select --+index(DACC IU_M_SAP_DETG_FS_ACC)
+          max (dacc.o_stat_code) KEEP (DENSE_RANK first ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+          from
+                m_sap_detg_fs_acc dacc
+          where
+          dacc.i_detg_detg_id = bd.detg_detg_id
+          and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+          and nvl(dacc.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+          --and dacc.filial_id=in_filial_id
+          and dacc.start_date<=last_day(in_month_date)
+          and dacc.end_date>=last_day(in_month_date)
+         ) STAT_CODE,
+         1 ACOUNT_TYPE,
+         sc.is_vat IS_VAT,
+         (
+          select --+index(MSC IU_M_SAP_CLIENTS)
+                max(msc.o_sap_clnt_id ) keep (dense_rank first order by msc.i_clnt_id, msc.i_ctyp_ctyp_id, msc.i_jrtp_id, msc.i_clcl_id, msc.i_ccat_id, msc.i_is_vat, msc.I_BSTP_ID, msc.I_MASTER_SEGMENT_ID)
+          from
+              M_SAP_CLIENTS msc
+          where
+           nvl(msc.i_clnt_id,-999) in (-999, sc.clnt_clnt_id)
+           and nvl(msc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+           and nvl(msc.i_ccat_id,-999) in (-999, sc.ccat_ccat_id)
+           and nvl(msc.i_is_vat,-999) in (-999, sc.is_vat)
+           and nvl(msc.i_clcl_id,-999) in (-999, sc.clcl_clcl_id)
+           and nvl(msc.i_jrtp_id,-999) in (-999, sc.jrtp_jrtp_id)
+           and nvl(msc.i_bstp_id ,-999) in (-999, sc.BSTP_BSTP_ID)
+           and nvl(msc.I_MASTER_SEGMENT_ID,-999) in (-999, sc.MASTER_SEGMENT_ID)
+           and msc.i_is_to is null -- не ТО
+           --and msc.filial_id = in_filial_id
+           and msc.start_date<=last_day(in_month_date)
+           and msc.end_date>=last_day(in_month_date)
+         ) SAP_CLNT_ID,
+         sc.bstp_bstp_id,
+         -1 PRCL_ID,
+         null cnt_to,
+
+         sc.CCAT_CCAT_ID,
+         sc.CLCL_CLCL_ID,
+         b.BILL_ID,
+         -1 AJMT_ID,
+         -1 FUCT_ID,
+         last_day(in_month_date) FUCT_DATE,
+         1 IS_UPLOADING2SAP
+    FROM
+        bis_bills b,
+        bis_bill_details bd,
+        bis_bill_types bt,
+       (
+            select
+            case when ct.clnt_clnt_id is not null then 1 else 0 end is_vat,
+            sc1.*
+            from
+                s_clients sc1,
+                bis_client_Taxes ct
+            where
+                sc1.filial_id=nvl(in_filial_id,sc1.filial_id)
+                and sc1.snap_date=last_day(in_month_date)
+                and ct.clnt_clnt_id(+)=sc1.clnt_clnt_id
+                and ct.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+                and ct.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+                and ct.tax_tax_id(+)=1
+        ) sc
+
+    WHERE
+       b.bill_date>= TRUNC(in_month_date,'MM')
+       and b.bill_date< add_months(trunc(in_month_date,'mm'),1)
+       and bd.bill_bill_id =  b.bill_id
+       and bd.subs_subs_id IS NULL
+       --and (b.bltp_bltp_id <> 0 or b.bltp_bltp_id is null)
+       and nvl(b.no_use,'N')!='Y'
+       and bt.bltp_id(+)=b.bltp_bltp_id
+       and (NVL (bd.amount_r, 0 ) <>  0 OR  NVL (bd.vat_r, 0 ) <>  0)
+       and sc.clnt_clnt_id = b.clnt_clnt_id
+       and sc.master_segment_id > 0
+       and not exists
+       (
+       select 1
+       from
+           m_sap_clients_exception sce1
+       where
+           --sce1.filial_id=in_filial_id
+               sce1.direction=0
+           and sce1.clnt_id=b.clnt_clnt_id
+           and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+           and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+       )
+       and not exists
+       (
+       select 1
+       from
+           m_sap_clients_exception sce1
+       where
+           --sce1.filial_id=in_filial_id
+               sce1.direction=0
+           and sce1.detg_id=bd.detg_detg_id
+           and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+           and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+       )
+       and not exists
+       (
+       select 1
+       from
+           m_sap_clients_exception sce1
+       where
+           --sce1.filial_id=in_filial_id
+           	   sce1.direction=0
+           and sce1.brnc_id = sc.brnc_brnc_id
+           and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+           and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+       )
+       and not exists
+       (
+       select 1
+       from
+           m_sap_clients_exception sce1
+       where
+           --sce1.filial_id=in_filial_id
+               sce1.direction=0
+           and sce1.ctyp_id=sc.ctyp_ctyp_id
+           and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+           and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+       )
+        --только клиенты по которым выставлены счет-фактуры
+        and exists (select 1 from f_salebook_monthly_fuct_tmp ft where ft.clnt_clnt_id=b.clnt_clnt_id)
+        group by
+            sc.filial_id,
+            sc.clnt_clnt_id,
+            sc.brnc_brnc_id,
+            sc.jrtp_jrtp_id,
+            bt.divn_divn_id,
+            bd.detg_detg_id,
+            sc.ctyp_ctyp_id,
+            sc.bseg_bseg_id,
+            sc.clcl_clcl_id,
+            sc.ccat_ccat_id,
+            sc.is_vat,
+            sc.bstp_bstp_id,
+            sc.CCAT_CCAT_ID,
+            sc.CLCL_CLCL_ID,
+            b.BILL_ID,
+            sc.MASTER_SEGMENT_ID
+
+        ;
+        r := sql%ROWCOUNT;
+        commit;
+
+       pub_ds.job_log.write_detail_log(in_comment_text => 'load_data_bills',in_rows_processed => r);
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_data_bills: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+    PROCEDURE load_single_charges (in_filial_id NUMBER, in_month_date IN date) IS
+       v_sdate varchar2(8);
+       r NUMBER;
+    BEGIN
+                v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+
+                insert /*+ append parallel(8)*/ into F_SAP_CLNT_SALES_MONTHLY_TMP
+                (
+                BILL_MONTH,
+                BILL_DATE,
+                FILIAL_ID,
+                CLNT_CLNT_ID,
+                BRNC_ID,
+                JRTP_ID,
+                DIVN_ID,
+                AMOUNT_ALL,
+                VAT,
+                AMOUNT,
+                DETG_ID,
+                BSEG_ID,
+                CTYP_ID,
+                FS_FS_ID,
+                ACC_ACC_ID,
+                STAT_CODE,
+                ACOUNT_TYPE,
+                IS_VAT,
+                SAP_CLNT_ID,
+                BSTP_ID,
+                PRCL_ID,
+                CNT_TO,
+
+                CCAT_ID,
+                CLCL_ID,
+                BILL_ID,
+                AJMT_ID,
+                FUCT_ID,
+                FUCT_DATE,
+                INV_NUMBER,
+                INV_DATE,
+                TRUE_FACT_DATE,
+                IS_UPLOADING2SAP
+                )
+                select
+                      trunc(in_month_date,'MM') BILL_MONTH,
+                      last_day(in_month_date) BILL_DATE,
+                      sc.FILIAL_ID,
+                      sc.clnt_clnt_id,
+                      sc.brnc_brnc_id,
+                      sc.jrtp_jrtp_id,
+                      1 divn_id, -- нулы скидываем в 1 производство
+                      SUM(NVL(ind.price_r, 0)) amount_all,
+                      SUM(NVL(ind.vat_r,0)) vat,
+                      SUM(NVL(ind.price_r, 0) - NVL (ind.vat_r, 0)) amount,
+                      -1    detg_detg_id,
+                      sc.bseg_bseg_id,
+                      sc.ctyp_ctyp_id,
+                 (
+                  select
+                        max(dfs.o_fs_id ) keep (dense_rank FIRST order by dfs.i_ctyp_ctyp_id, dfs.i_bstp_id)
+                  from
+                        m_sap_detg_fs_acc dfs
+                  where
+                   dfs.i_prcl_prcl_id = ind.prcl_prcl_id
+                   and nvl(dfs.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+                   and nvl(dfs.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+                   --and dfs.filial_id = in_filial_id
+                   and dfs.start_date<=last_day(in_month_date)
+                   and dfs.end_date>=last_day(in_month_date)
+                 ) FS_FS_ID,
+                 (
+                  select max (dacc.o_acc_id) KEEP (DENSE_RANK FIRST ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+                  from
+                        m_sap_detg_fs_acc dacc
+                  where
+                  dacc.i_prcl_prcl_id = ind.prcl_prcl_id
+                  and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+                  and nvl(dacc.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+                  --and dacc.filial_id = in_filial_id
+                  and dacc.start_date<=last_day(in_month_date)
+                  and dacc.end_date>=last_day(in_month_date)
+                 ) acc_acc_id,
+                 (
+                  select max (dacc.o_stat_code) KEEP (DENSE_RANK FIRST ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+                  from
+                        m_sap_detg_fs_acc dacc
+                  where
+                  dacc.i_prcl_prcl_id = ind.prcl_prcl_id
+                  and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+                  and nvl(dacc.i_bstp_id,-999) in (-999, sc.bstp_bstp_id)
+                  --and dacc.filial_id=in_filial_id
+                  and dacc.start_date<=last_day(in_month_date)
+                  and dacc.end_date>=last_day(in_month_date)
+                 ) STAT_CODE,
+                 2 ACOUNT_TYPE,
+                 sc.is_vat IS_VAT,
+                 (
+                      select
+                            max(msc.o_sap_clnt_id ) keep (dense_rank first order by msc.i_is_to, msc.i_clnt_id, msc.i_ctyp_ctyp_id, msc.i_jrtp_id, msc.i_clcl_id, msc.i_ccat_id, msc.i_is_vat, msc.I_BSTP_ID, msc.I_MASTER_SEGMENT_ID)
+                      from
+                            M_SAP_CLIENTS msc
+                      where
+                       nvl(msc.i_clnt_id,-999) in (-999, sc.clnt_clnt_id)
+                       and nvl(msc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+                       and nvl(msc.i_ccat_id,-999) in (-999, sc.ccat_ccat_id)
+                       and nvl(msc.i_is_vat,-999) in (-999, sc.is_vat)
+                       and nvl(msc.i_clcl_id,-999) in (-999, sc.clcl_clcl_id)
+                       and nvl(msc.i_jrtp_id,-999) in (-999, sc.jrtp_jrtp_id)
+                       and nvl(msc.i_bstp_id,-999) in (-999, sc.BSTP_BSTP_ID)
+                       and nvl(msc.i_is_to,-999) in (-999, 1)
+                       and nvl(msc.I_MASTER_SEGMENT_ID,-999) in (-999, sc.MASTER_SEGMENT_ID)
+                       --and msc.filial_id = in_filial_id
+                       and msc.start_date<=last_day(in_month_date)
+                       and msc.end_date>=last_day(in_month_date)
+                  ) SAP_CLNT_ID,
+                 sc.bstp_bstp_id BSTP_ID,
+                 ind.prcl_prcl_id PRCL_ID,
+                 0 CNT_TO,
+
+                 sc.CCAT_CCAT_ID,
+                 sc.CLCL_CLCL_ID,
+                 f.BILL_BILL_ID,
+                 -1 AJMT_ID,
+                 f.FUCT_ID FUCT_ID,
+                 last_day(in_month_date) FUCT_DATE,
+                 i.INV_NUMBER,
+                 i.INV_DATE,
+                 f.fuct_date,
+                 1 IS_UPLOADING2SAP
+                FROM
+                    bis_fucturies f,
+                    bis_invoices i,
+                    bis_invoice_details ind,
+                    (
+                    select
+                    case when ct.clnt_clnt_id is not null then 1 else 0 end is_vat,
+                    sc1.*
+                    from
+                        s_clients sc1,
+                        bis_client_Taxes ct
+                    where
+                        sc1.filial_id=nvl(in_filial_id,sc1.filial_id)
+                        and sc1.snap_date=last_day(in_month_date)
+                        and ct.clnt_clnt_id(+)=sc1.clnt_clnt_id
+                        and ct.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+                        and ct.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+                        and ct.tax_tax_id(+)=1
+                   ) sc
+                WHERE
+                    i.INVC_ID = ind.INVC_INVC_ID
+                    and ind.invc_invc_id     =   f.invc_invc_id
+                    AND ind.fuct_fuct_id     >   0 -- Выбор только отражаемых на балансе деталей
+
+                    and f.fuct_date>= TRUNC(in_month_date,'MM')
+                    and f.fuct_date< add_months(trunc(in_month_date,'mm'),1)
+
+                    AND f.fttp_fttp_id      <>  3
+                    AND ( NVL ( ind.price_r, 0 ) <>  0
+                    OR  NVL ( ind.vat_r, 0 ) <>  0 )
+
+                    and sc.clnt_clnt_id = f.clnt_clnt_id
+--                    and sc.filial_id = in_filial_id
+                    and sc.snap_date = last_day(in_month_date)
+                    and sc.master_segment_id > 0 --коммерческие
+                    and not exists
+                   (
+                   select 1
+                   from
+                       m_sap_clients_exception sce1
+                   where
+                       --sce1.filial_id=in_filial_id
+                           sce1.direction=0
+                       and
+                       (
+                         sce1.clnt_id=sc.clnt_clnt_id
+                         or
+                         sce1.brnc_id = sc.brnc_brnc_id
+                         or
+                         sce1.ctyp_id=sc.ctyp_ctyp_id
+                       )
+                     )
+            group by
+                      sc.filial_id,
+                      sc.clnt_clnt_id,
+                      sc.brnc_brnc_id,
+                      sc.jrtp_jrtp_id,
+                      sc.bseg_bseg_id,
+                      sc.ctyp_ctyp_id,
+                      sc.clcl_clcl_id,
+                      sc.is_vat,
+                      sc.ccat_ccat_id,
+                      sc.bstp_bstp_id,
+                      ind.prcl_prcl_id,
+                      f.BILL_BILL_ID,
+                      f.FUCT_ID,
+                      i.INV_NUMBER,
+                      i.INV_DATE,
+                      f.fuct_date,
+                      sc.MASTER_SEGMENT_ID
+            ;
+            commit;
+
+            r := sql%ROWCOUNT;
+            commit;
+
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_single_charges',in_rows_processed => r);
+
+      EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_single_charges: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+
+  END;
+
+
+  PROCEDURE load_to (in_filial_id IN NUMBER, in_month_date IN date) IS
+        v_sdate varchar2(8);
+        r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+        -- убрать на бою
+        /*delete F_SAP_CLNT_SALES_MONTHLY_TMP t
+        where
+             t.filial_id = in_filial_id
+             and t.acount_type=3;
+        commit;
+        */
+         insert /*+ append parallel(8)*/
+         into F_SAP_CLNT_SALES_MONTHLY_TMP
+         (
+            BILL_MONTH,
+            BILL_DATE,
+            FILIAL_ID,
+            CLNT_CLNT_ID,
+            BRNC_ID,
+            JRTP_ID,
+            DIVN_ID,
+            AMOUNT_ALL,
+            VAT,
+            AMOUNT,
+            DETG_ID,
+            BSEG_ID,
+            CTYP_ID,
+            FS_FS_ID,
+            ACC_ACC_ID,
+            STAT_CODE,
+            ACOUNT_TYPE,
+            IS_VAT,
+            SAP_CLNT_ID,
+            BSTP_ID,
+            PRCL_ID,
+            CNT_TO,
+
+            CCAT_ID,
+            CLCL_ID,
+            BILL_ID,
+            AJMT_ID,
+            FUCT_ID,
+            FUCT_DATE,
+            IS_UPLOADING2SAP
+         )
+         select
+              trunc(in_month_date,'MM') BILL_MONTH,
+              last_day(in_month_date) BILL_DATE,
+              sc.FILIAL_ID,
+              sc.clnt_clnt_id CLNT_ID,
+              sc.brnc_brnc_id BRNC_ID,
+              sc.jrtp_jrtp_id JRTP_ID,
+              1 DIVN_ID,
+              sum(es.amount_$) AMOUNT_ALL,
+              sum(es.vat_$) VAT,
+              sum(es.amount_$-es.vat_$) AMOUNT,
+              null DETG_ID,
+              sc.bseg_bseg_id BSEG_ID,
+              sc.ctyp_ctyp_id CTYP_ID,
+              (
+              select
+              max(sa.o_fs)
+              from m_sap_accounts sa
+              where
+                  --sa.filial_id = in_filial_id
+                      sa.i_prcl_id  = es.prcl_prcl_id
+                  and sa.start_date <= last_day(in_month_date)+1-1/24/60/60
+                  and sa.end_date >= last_day(in_month_date)+1-1/24/60/60
+              )
+               FS_FS_ID,
+              -1 ACC_ACC_ID,
+              null STAT_CODE,
+              3 ACOUNT_TYPE,
+              null IS_VAT,
+              (
+              select
+                    max(msc.o_sap_clnt_id ) keep (dense_rank first order by msc.i_clnt_id, msc.i_ctyp_ctyp_id, msc.i_jrtp_id, msc.i_clcl_id, msc.i_ccat_id, /*sc.is_vat,*/ msc.I_BSTP_ID, msc.I_MASTER_SEGMENT_ID)
+              from M_SAP_CLIENTS msc
+              where
+               nvl(msc.i_clnt_id,-999) in (-999, sc.clnt_clnt_id)
+               and nvl(msc.i_ctyp_ctyp_id,-999) in (-999, sc.ctyp_ctyp_id)
+               and nvl(msc.i_ccat_id,-999) in (-999, sc.ccat_ccat_id)
+               --and nvl(msc.i_is_vat,-999) in (-999, sc.is_vat)
+               and nvl(msc.i_clcl_id,-999) in (-999, sc.clcl_clcl_id)
+               and nvl(msc.i_jrtp_id,-999) in (-999, sc.jrtp_jrtp_id)
+               and nvl(msc.i_bstp_id ,-999) in (-999, sc.BSTP_BSTP_ID)
+               and nvl(msc.I_MASTER_SEGMENT_ID,-999) in (-999, sc.MASTER_SEGMENT_ID)
+               --and msc.filial_id = in_filial_id
+               and msc.start_date<=last_day(in_month_date)
+               and msc.end_date>=last_day(in_month_date)
+              ) SAP_CLNT_ID,
+              sc.bstp_bstp_id BSTP_ID,
+              es.prcl_prcl_id PRCL_ID,
+              count(es.chrg_id) as cnt_to,
+
+              sc.CCAT_CCAT_ID,
+              sc.CLCL_CLCL_ID,
+              b.BILL_ID,
+              -1 AJMT_ID,
+              -1 FUCT_ID,
+              last_day(in_month_date) FUCT_DATE,
+              1 IS_UPLOADING2SAP
+            from
+                bis_charges    es,
+                bis_bills b,
+                s_clients sc
+            where
+                es.bill_bill_id=b.bill_id
+            and b.bill_date>= TRUNC(in_month_date,'MM')
+            and b.bill_date< add_months(trunc(in_month_date,'mm'),1)
+            and es.del_user is null
+            and sc.clnt_clnt_id=b.clnt_clnt_id
+            and sc.filial_id=nvl(in_filial_id,sc.FILIAL_ID)
+            and sc.snap_date=last_day(in_month_date)
+            and sc.master_segment_id > 0
+            and exists (select 1 from m_sap_accounts sa
+                       where
+                            --and sa.filial_id = in_filial_id
+                                sa.i_prcl_id=es.prcl_prcl_id
+                            and sa.start_date <= last_day(trunc(in_month_date,'MM'))+1-1/24/60/60
+                            and sa.end_date >= last_day(trunc(in_month_date,'MM'))+1-1/24/60/60
+                        )
+            group by
+              sc.filial_id,
+              sc.clnt_clnt_id,
+              sc.brnc_brnc_id,
+              sc.jrtp_jrtp_id,
+              sc.bseg_bseg_id,
+              sc.ctyp_ctyp_id,
+              sc.bstp_bstp_id,
+              es.prcl_prcl_id,
+              sc.clcl_clcl_id,
+              sc.ccat_ccat_id,
+              b.BILL_ID,
+              sc.MASTER_SEGMENT_ID
+        ;
+        commit;
+
+
+        r := sql%ROWCOUNT;
+        commit;
+
+       pub_ds.job_log.write_detail_log(in_comment_text => 'load_to',in_rows_processed => r);
+
+      EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_to: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+  PROCEDURE load_fuct_prev_period (in_filial_id IN NUMBER, in_month_date IN date) IS
+        v_sdate varchar2(8);
+    r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+
+        insert /*+ append parallel(8)*/
+        into F_SAP_CLNT_SALES_MONTHLY_TMP
+        (
+            BILL_MONTH,
+            BILL_DATE,
+            FILIAL_ID,
+            CLNT_CLNT_ID,
+            BRNC_ID,
+            JRTP_ID,
+            DIVN_ID,
+            AMOUNT_ALL,
+            VAT,
+            AMOUNT,
+            DETG_ID,
+            BSEG_ID,
+            CTYP_ID,
+            FS_FS_ID,
+            ACC_ACC_ID,
+            STAT_CODE,
+            ACOUNT_TYPE,
+            IS_VAT,
+            SAP_CLNT_ID,
+            BSTP_ID,
+            PRCL_ID,
+            CNT_TO,
+            CCAT_ID,
+            CLCL_ID,
+            BILL_ID,
+            AJMT_ID,
+            FUCT_ID,
+            FUCT_DATE,
+            IS_UPLOADING2SAP
+        )
+        select
+                res.BILL_MONTH,
+                res.BILL_DATE,
+                res.FILIAL_ID,
+                res.CLNT_ID,
+                res.BRNC_ID,
+                res.JRTP_ID,
+                res.DIVN_ID,
+                res.AMOUNT_ALL,
+                res.VAT,
+                res.AMOUNT,
+                res.DETG_ID,
+                res.BSEG_ID,
+                res.CTYP_ID,
+                (
+                  select
+                        max(dfs.o_fs_id ) keep (dense_rank first order by dfs.i_ctyp_ctyp_id, dfs.i_bstp_id)
+                  from
+                      m_sap_detg_fs_acc dfs
+                  where
+                   dfs.i_detg_detg_id = res.detg_id
+                   and nvl(dfs.i_ctyp_ctyp_id,-999) in (-999, res.ctyp_id)
+                   and nvl(dfs.i_bstp_id,-999) in (-999, res.bstp_id)
+                   --and dfs.filial_id = in_filial_id
+                   and dfs.start_date<=last_day(in_month_date)
+                   and dfs.end_date>=last_day(in_month_date)
+                 ) FS_FS_ID,
+                 (
+                  select max (dacc.o_acc_id) KEEP (DENSE_RANK first ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+                  from
+                        m_sap_detg_fs_acc dacc
+                  where
+                  dacc.i_detg_detg_id = res.detg_id
+                  and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, res.ctyp_id)
+                  and nvl(dacc.i_bstp_id,-999) in (-999, res.bstp_id)
+                  --and dacc.filial_id = in_filial_id
+                  and dacc.start_date<=last_day(in_month_date)
+                  and dacc.end_date>=last_day(in_month_date)
+                 ) acc_acc_id,
+                 (
+                  select max (dacc.o_stat_code) KEEP (DENSE_RANK first ORDER BY dacc.i_ctyp_ctyp_id, dacc.i_bstp_id)
+                  from
+                        m_sap_detg_fs_acc dacc
+                  where
+                  dacc.i_detg_detg_id = res.detg_id
+                  and nvl(dacc.i_ctyp_ctyp_id,-999) in (-999, res.ctyp_id)
+                  and nvl(dacc.i_bstp_id,-999) in (-999, res.bstp_id)
+                  --and dacc.filial_id=in_filial_id
+                  and dacc.start_date<=last_day(in_month_date)
+                  and dacc.end_date>=last_day(in_month_date)
+                 ) STAT_CODE,
+                res.ACOUNT_TYPE,
+                res.IS_VAT,
+                (
+                  select
+                        max(msc.o_sap_clnt_id ) keep (dense_rank first order by msc.i_clnt_id, msc.i_ctyp_ctyp_id, msc.i_jrtp_id, msc.i_clcl_id, msc.i_ccat_id, msc.i_is_vat, msc.I_BSTP_ID, msc.I_MASTER_SEGMENT_ID)
+                  from
+                      M_SAP_CLIENTS msc
+                  where
+                   nvl(msc.i_clnt_id,-999) in (-999, res.clnt_id)
+                   and nvl(msc.i_ctyp_ctyp_id,-999) in (-999, res.ctyp_id)
+                   and nvl(msc.i_ccat_id,-999) in (-999, res.ccat_id)
+                   and nvl(msc.i_is_vat,-999) in (-999, res.is_vat)
+                   and nvl(msc.i_clcl_id,-999) in (-999, res.clcl_id)
+                   and nvl(msc.i_jrtp_id,-999) in (-999, res.jrtp_id)
+                   and nvl(msc.i_bstp_id ,-999) in (-999, res.BSTP_ID)
+                   and nvl(msc.I_MASTER_SEGMENT_ID,-999) in (-999, res.MASTER_SEGMENT_ID)
+                   and msc.i_is_to is null -- не ТО
+                   --and msc.filial_id = in_filial_id
+                   and msc.start_date<=last_day(in_month_date)
+                   and msc.end_date>=last_day(in_month_date)
+                 ) SAP_CLNT_ID,
+                res.BSTP_ID,
+                res.PRCL_ID,
+                res.CNT_TO,
+
+                res.ccat_id,
+                res.clcl_id,
+                res.bill_id,
+                res.ajmt_id,
+                res.fuct_id,
+                res.fuct_date,
+                1 IS_UPLOADING2SAP
+
+        from
+        (
+        select /*+ dynamic_sampling(b 6) */
+            trunc(in_month_date,'MM') BILL_MONTH,
+            last_day(in_month_date)   BILL_DATE,
+            sc.filial_id              FILIAL_ID,
+            ad.clnt_clnt_id            CLNT_ID,
+            sc.brnc_brnc_id            BRNC_ID,
+            sc.jrtp_jrtp_id            JRTP_ID,
+            nvl(bt.divn_divn_id,1)     DIVN_ID,
+            ad.amount_$                AMOUNT_ALL,
+            ad.vat_$                   VAT,
+            nvl(ad.amount_$,0)-nvl(ad.vat_$,0)  AMOUNT,
+            case
+                 when ad.amount_$>=0 then (select max(sca.detg_id) from m_sap_changes_adjustments sca where sca.duration=1 and sca.start_date<=in_month_date and sca.end_date>=in_month_date)
+                 when ad.amount_$<0 then (select max(sca.detg_id) from m_sap_changes_adjustments sca where sca.duration=2 and sca.start_date<=in_month_date and sca.end_date>=in_month_date)
+                 else null
+            end                         DETG_ID,
+            sc.bseg_bseg_id             BSEG_ID,
+            sc.ctyp_ctyp_id             CTYP_ID,
+            5                           ACOUNT_TYPE,
+            sc.is_vat                   IS_VAT,
+            sc.bstp_bstp_id             BSTP_ID,
+            -1                          PRCL_ID,
+            0                           CNT_TO,
+            sc.ccat_ccat_id             ccat_id,
+            sc.clcl_clcl_id             clcl_id,
+            b.bill_id                   bill_id,
+            ad.ajmt_id                  ajmt_id,
+            ad.fuct_fuct_id              fuct_id,
+            --last_day(trunc(f.fuct_date)) fuct_date
+            case when fp.fisc_end_date is null or nvl(sc.jrtp_jrtp_id,1) != 2 then last_day(in_month_date) --
+                 else last_day(trunc(fp.fisc_end_date))
+            end fuct_date,
+            sc.master_segment_id
+        from
+             bis_bills b,
+             bis_adjustments ad,
+             --bis_fucturies f,
+             BIS_FISCAL_PERIODS fp,
+
+             bis_bill_types bt,
+             (
+                    select
+                    case when ct.clnt_clnt_id is not null then 1 else 0 end is_vat,
+                    sc1.*
+                    from
+                        s_clients sc1,
+                        bis_client_Taxes ct
+                    where
+                        sc1.filial_id=nvl(in_filial_id,sc1.filial_id)
+                        and sc1.snap_date=last_day(in_month_date)
+                        and ct.clnt_clnt_id(+)=sc1.clnt_clnt_id
+                        and ct.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+                        and ct.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+                        and ct.tax_tax_id(+)=1
+                ) sc
+        where
+              b.BILL_DATE>=trunc(in_month_date,'MM')
+              and b.BILL_DATE<last_day(in_month_date)+1
+              and nvl(b.no_use,'N')!='Y'
+              and ad.bill_bill_id=b.bill_id
+              and ad.ajtp_ajtp_id=3
+              and ad.del_date is null
+
+              --and ad.fuct_fuct_id=f.fuct_id
+              --and f.del_date is null
+              and fp.fisp_id(+)=ad.fisp_fisp_id
+
+              and bt.bltp_id(+)=b.bltp_bltp_id
+
+              and sc.clnt_clnt_id = ad.clnt_clnt_id
+              and sc.snap_date=last_day(in_month_date)
+              and sc.master_segment_id > 0
+              and exists (select 1 from bis_fucturies f where f.BILL_BILL_ID=b.bill_id and f.FISP_FISP_ID is not null) -- добавлять fuct_date только для с/ф в которых он проставлен
+              and not exists
+               (
+               select 1
+               from
+                   m_sap_clients_exception sce1
+               where
+                   --sce1.filial_id=in_filial_id
+                       sce1.direction=0
+                   and
+                   (
+                     sce1.clnt_id=ad.clnt_clnt_id
+                     or
+                     sce1.brnc_id = sc.brnc_brnc_id
+                     or
+                     sce1.ctyp_id=sc.ctyp_ctyp_id
+                   )
+                   and sce1.start_date(+) <= last_day(in_month_date)+1-1/24/60/60
+                   and sce1.end_date(+) > last_day(in_month_date)+1-1/24/60/60
+               )
+        ) res
+        ;
+        commit;
+
+
+        r := sql%ROWCOUNT;
+        commit;
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_fuct_prev_period1',in_rows_processed => r);
+
+
+        insert /*+ append parallel(8)*/
+        into F_SAP_CLNT_SALES_MONTHLY_TMP
+        (
+            BILL_MONTH,
+            BILL_DATE,
+            FILIAL_ID,
+            CLNT_CLNT_ID,
+            BRNC_ID,
+            JRTP_ID,
+            DIVN_ID,
+            AMOUNT_ALL,
+            VAT,
+            AMOUNT,
+            DETG_ID,
+            BSEG_ID,
+            CTYP_ID,
+            FS_FS_ID,
+            ACC_ACC_ID,
+            STAT_CODE,
+            ACOUNT_TYPE,
+            IS_VAT,
+            SAP_CLNT_ID,
+            BSTP_ID,
+            PRCL_ID,
+            CNT_TO,
+            CCAT_ID,
+            CLCL_ID,
+            BILL_ID,
+            AJMT_ID,
+            FUCT_ID,
+            FUCT_DATE,
+            IS_UPLOADING2SAP
+        )
+        select
+            t.BILL_MONTH,
+            t.BILL_DATE,
+            t.FILIAL_ID,
+            t.CLNT_CLNT_ID,
+            t.BRNC_ID,
+            t.JRTP_ID,
+            t.DIVN_ID,
+            t.AMOUNT_ALL*-1 AMOUNT_ALL,
+            t.VAT*-1 VAT,
+            t.AMOUNT*-1 AMOUNT,
+            t.DETG_ID,
+            t.BSEG_ID,
+            t.CTYP_ID,
+            t.FS_FS_ID,
+            t.ACC_ACC_ID,
+            t.STAT_CODE,
+            6 ACOUNT_TYPE,
+            t.IS_VAT,
+            t.SAP_CLNT_ID,
+            t.BSTP_ID,
+            t.PRCL_ID,
+            t.CNT_TO,
+            t.CCAT_ID,
+            t.CLCL_ID,
+            t.BILL_ID,
+            t.AJMT_ID,
+            t.FUCT_ID,
+            t.BILL_DATE FUCT_DATE,
+            t.IS_UPLOADING2SAP
+        from F_SAP_CLNT_SALES_MONTHLY_TMP t
+        where t.acount_type=5
+        ;
+        commit;
+
+
+
+        r := sql%ROWCOUNT;
+        commit;
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_fuct_prev_period2',in_rows_processed => r);
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_fuct_prev_period: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+
+  PROCEDURE load_delta_fucturies_bill_det (in_month_date IN date) IS
+        v_sdate varchar2(8);
+    r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+        insert /*+ append parallel(8)*/
+        into F_SAP_CLNT_SALES_MONTHLY_TMP
+        (
+            BILL_MONTH,
+            BILL_DATE,
+            FILIAL_ID,
+            CLNT_CLNT_ID,
+            BRNC_ID,
+            JRTP_ID,
+            DIVN_ID,
+            AMOUNT_ALL,
+            VAT,
+            AMOUNT,
+            DETG_ID,
+            BSEG_ID,
+            CTYP_ID,
+            FS_FS_ID,
+            ACC_ACC_ID,
+            STAT_CODE,
+            ACOUNT_TYPE,
+            IS_VAT,
+            SAP_CLNT_ID,
+            BSTP_ID,
+            PRCL_ID,
+            CNT_TO,
+
+            CCAT_ID,
+            CLCL_ID,
+            BILL_ID,
+            AJMT_ID,
+            FUCT_ID,
+            FUCT_DATE,
+            IS_UPLOADING2SAP
+        )
+            select
+                BILL_MONTH,
+                BILL_DATE,
+                FILIAL_ID,
+                CLNT_CLNT_ID,
+                BRNC_ID,
+                JRTP_ID,
+                DIVN_ID,
+                AMOUNT_ALL,
+                VAT,
+                AMOUNT,
+                DETG_ID,
+                BSEG_ID,
+                CTYP_ID,
+                FS_FS_ID,
+                ACC_ACC_ID,
+                STAT_CODE,
+                ACOUNT_TYPE,
+                IS_VAT,
+                SAP_CLNT_ID,
+                BSTP_ID,
+                PRCL_ID,
+                CNT_TO,
+
+                CCAT_ID,
+                CLCL_ID,
+                BILL_ID,
+                AJMT_ID,
+                FUCT_ID,
+                FUCT_DATE,
+                1 IS_UPLOADING2SAP
+            from
+            (
+            select
+                row_number() OVER (PARTITION BY t.clnt_clnt_id ORDER BY t.acount_type, t.amount_all desc, t.detg_id, t.prcl_id) rn,
+                t.BILL_MONTH,
+                t.BILL_DATE,
+                t.FILIAL_ID,
+                t.CLNT_CLNT_ID,
+                t.BRNC_ID,
+                t.JRTP_ID,
+                t.DIVN_ID,
+                res2.delta_amount_all AMOUNT_ALL,
+                res2.delta_vat VAT,
+                res2.delta_amount AMOUNT,
+                t.DETG_ID,
+                t.BSEG_ID,
+                t.CTYP_ID,
+                t.FS_FS_ID,
+                t.ACC_ACC_ID,
+                t.STAT_CODE,
+                4 ACOUNT_TYPE,
+                t.IS_VAT,
+                t.SAP_CLNT_ID,
+                t.BSTP_ID,
+                t.PRCL_ID,
+                t.CNT_TO,
+
+                t.CCAT_ID,
+                t.CLCL_ID,
+                t.BILL_ID,
+                t.AJMT_ID,
+                t.FUCT_ID,
+                t.FUCT_DATE
+            from
+            (
+            select
+                res.*
+            from
+            (
+            select
+              bl.clnt_clnt_id,
+              nvl(ft.amount,0)-nvl(bl.amount_all,0) delta_amount_all,
+              nvl(ft.vat,0)-nvl(bl.vat,0) delta_vat,
+              (nvl(ft.amount,0)-nvl(bl.amount_all,0))-(nvl(ft.vat,0)-nvl(bl.vat,0)) delta_amount
+            from
+                f_salebook_monthly_fuct_tmp ft,
+            (
+            select
+                csm.clnt_clnt_id,
+                SUM(csm.amount_all) amount_all,
+                SUM(csm.vat) vat,
+                SUM(csm.amount) amount
+            from F_SAP_CLNT_SALES_MONTHLY_TMP csm
+            group by csm.clnt_clnt_id
+            ) bl
+            where
+                bl.clnt_clnt_id=ft.clnt_clnt_id
+            ) res
+            where
+                res.delta_amount_all!=0
+                or
+                res.delta_vat!=0
+                or
+                res.delta_amount!=0
+            ) res2,
+              F_SAP_CLNT_SALES_MONTHLY_TMP t
+            where
+               t.clnt_clnt_id=res2.clnt_clnt_id
+            ) res3
+            where
+              res3.rn=1
+            ;
+            commit;
+
+            r := sql%ROWCOUNT;
+            commit;
+
+       pub_ds.job_log.write_detail_log(in_comment_text => 'load_delta_fucturies_bill_det',in_rows_processed => r);
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_delta_fucturies_bill_det: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+
+  PROCEDURE load_salebook (in_month_date IN date) IS
+        v_sdate varchar2(8);
+        r NUMBER;
+  BEGIN
+
+        v_sdate:=to_char(in_month_date,'YYYYMMDD');
+
+        --сбрасываем выравнивание по с/ф ТО в ТО
+        update /*+parallel(8)*/ F_SAP_CLNT_SALES_MONTHLY_TMP t
+        set t.acount_type=3
+        where t.prcl_id !=-1 and t.acc_acc_id=-1 and t.acount_type=4;
+        commit;
+
+        --включить на бою!!!!!!!!!!!!!
+        --EXECUTE IMMEDIATE 'alter table f_sap_sales_monthly truncate partition SAP_SALEBOOK_'
+        --               || to_char(to_date(v_sdate,'YYYYMMDD'),'YYYYMM');
+        EXECUTE IMMEDIATE 'truncate table f_sap_sales_monthly_tmp';
+
+        --SAP выгрузка всего без ТО
+        insert /*+ append parallel(8) */
+        into F_SAP_SALES_MONTHLY_TMP
+        (
+            FILIAL_ID,
+            BILL_MONTH,
+            DID,
+            date1,
+            DATE2,
+            BUKRS,
+            TYPE2,
+            DTIP,
+            TEXT,
+            CURR,
+            DEBITOR,
+            POS_NUM,
+            INN,
+            FS,
+            PFM,
+            KP,
+            TAXCODE,
+            ZAKAZ,
+            TEXT1,
+            NALOG,
+            PROJK,
+            XREF1,
+            RED,
+            SUMM_DOC,
+            SUMM_R,
+            SUMM_D,
+            CNT_TO,
+            ACOUNT_TYPE,
+            CLIENT_TYPE
+        )
+        with agg as (
+                select /*+parallel(8) materialize*/
+                    t.filial_id,
+                    t.bill_month,
+                    t.bill_date,
+                    case when sc.acc_charges in (62020090,62030090) then null
+                         else sc.sap_code
+                    end sap_code,
+                    sc.acc_charges,
+                    t.fs_fs_id,
+                    t.brnc_id,
+                    t.bseg_id,
+                    t.bstp_id,
+                    t.acc_acc_id,
+                    t.is_vat,
+                    t.divn_id,
+                    sc.currency_id,
+                    sum(t.amount_all) amount_all,
+                    sum(t.vat) vat,
+                    sum(t.amount) amount,
+                    t.prcl_id,
+                    sum(t.cnt_to) cnt_to,
+                    t.fuct_date,
+                    t.CTYP_ID,
+                    f.sap_code BUKRS
+                from F_SAP_CLNT_SALES_MONTHLY_TMP t,
+                     d_sap_clients sc,
+                     pub_ds.d_filials f
+                where
+                    1=1
+                    --and sc.filial_id=t.filial_id
+                    and sc.sap_clnt_id=t.sap_clnt_id
+
+                    and t.acount_type!=3 -- не ТО
+                    and t.filial_id = f.filial_id
+                group by
+                    t.filial_id,
+                    t.bill_month,
+                    t.bill_date,
+                    case when sc.acc_charges in (62020090,62030090) then null
+                         else sc.sap_code
+                    end,
+                    sc.acc_charges,
+                    t.fs_fs_id,
+                    t.brnc_id,
+                    t.bseg_id,
+                    t.bstp_id,
+                    t.acc_acc_id,
+                    t.is_vat,
+                    t.divn_id,
+                    sc.currency_id,
+                    t.prcl_id,
+                    t.fuct_date,
+                    t.CTYP_ID,
+                    f.sap_code
+        )
+        select
+            r3.filial_id,
+            r3.bill_month,
+            r3.DID,
+            r3.bill_date "DATE",
+            r3.fuct_date DATE2,
+            r3.BUKRS,
+            case when r3.is_vat=0 then 'NVAT'
+                 when r3.bstp_id in (2,3) then 'FIXI'
+                 else 'RUBL'
+            end TYPE2,
+            case when r3.is_vat=0 then 'd6'
+                 else 'd1'
+            end DTIP,
+            case when r3.is_vat=0 then 'Реализация без НДС'
+                 else 'Реализация коммерческ.'
+            end TEXT,
+            case when nvl(r3.currency_id,1)=1 then 'RUB'
+                 when nvl(r3.currency_id,1)=2 then 'USD'
+                 when nvl(r3.currency_id,1)=3 then 'EUR'
+            end CURR,
+            trim(r3.sap_code) DEBITOR,
+            case when sa.o_acc like '62%' then 1
+                 when sa.o_acc like '90%' and sa.o_fs not in ('99','502','602') then 2
+                 when instr(sa.o_acc,'2')=5 then 4
+                 when sa.o_acc like '90%' and sa.o_fs in ('99','502','602') then 3
+                 when sa.o_acc like '68%' and sa.o_fs in ('99','502','602') then 5
+            end POS_NUM,
+            case when trim(sa.o_acc) = '62' then r3.acc_charges
+                 else sa.o_acc
+            end INN,
+            case when sa.o_acc like '62%' and trim(r3.sap_code) is not null then 602
+                     when sa.o_acc like '62%' and trim(r3.sap_code) is null then 502
+                     else sa.o_fs
+            end FS,
+            r3.o_pfm PFM,
+            case when r3.amount_all<0 and sa.o_kp ='40' then '50'
+                     when r3.amount_all<0 and sa.o_kp ='50' then '40'
+                     --when r3.amount_all<0 and sa.o_kp ='01' then '11'
+                 else sa.o_kp
+            end KP,
+            case when sa.o_acc like '68%' then sa.o_taxcode
+                     else null
+            end TAXCODE,
+            case when sa.o_acc like '90%' and sa.o_fs not in ('99','502','602') then r3.o_zakaz
+                 else null
+            end ZAKAZ,
+            sa.o_text1 TEXT1,
+            sa.o_nalog NALOG,
+            sa.projk PROJK,
+            cast(null as VARCHAR2(50)) XREF1,
+            case when r3.amount_all<0 then 'X'
+                 else null
+            end RED,
+            r3.amount_all * nvl(sa.o_is_amount, 0) +  r3.vat * nvl(sa.o_is_amount_vat, 0) + r3.amount * nvl(sa.o_is_amount_wo_vat, 0) SUMM_DOC,
+            round((r3.amount_all * nvl(sa.o_is_amount, 0) +  r3.vat * nvl(sa.o_is_amount_vat, 0) + r3.amount * nvl(sa.o_is_amount_wo_vat, 0)) * nvl(cur.rate,1),2) SUMM_R,
+            0 SUMM_D,
+            r3.cnt_to,
+            1 acount_type,
+            (select def from bis_client_types ct where ct.ctyp_id = r3.ctyp_id) client_type
+        from
+        (
+
+        select
+            r2.DID_TEXT || ROW_NUMBER() over (partition by r2.DID_TEXT order by r2.acc_acc_id) did,
+            r2.*
+        from
+
+        (
+
+        select
+            case when r1.sap_code is not null then  trim(replace(replace(r1.sap_code, chr(10)), chr(13))) || 'R' || to_char(r1.bill_date,'DDMMYYYY')||'_'
+                 when r1.sap_code is null and r1.bstp_id not in (2,3) then 'A001R' || to_char(r1.bill_date,'DDMMYYYY')||'_'
+                 else 'A002R' || to_char(r1.bill_date,'DDMMYYYY')||'_'
+            end DID_TEXT,
+            r1.filial_id,
+            r1.bill_month,
+            r1.bill_date,
+            r1.sap_code,
+            r1.acc_charges,
+            r1.o_zakaz,
+            r1.o_pfm,
+            r1.acc_acc_id,
+            r1.fs_fs_id,
+            r1.is_vat,
+            r1.divn_id,
+            r1.bstp_id,
+            r1.currency_id,
+            sum(r1.amount_all) amount_all,
+            sum(r1.vat) vat,
+            sum(r1.amount) amount,
+            r1.prcl_id,
+            sum(r1.cnt_to) cnt_to,
+            r1.fuct_date,
+            r1.CTYP_ID,
+            r1.BUKRS
+        from
+        (
+        select
+            r.*,
+            (
+            select
+                max(sf.o_zakaz) keep (dense_rank first order by sf.i_fs_id, sf.i_brnc_id, sf.i_bseg_id, sf.i_bstp_id)
+            from
+                m_sap_financial sf
+            where
+            --sf.filial_id = r.filial_id
+                nvl(sf.i_fs_id,-999) in (-999, r.fs_fs_id)
+            and nvl(sf.i_brnc_id,-999) in (-999, r.brnc_id)
+            and nvl(sf.i_bseg_id,-999) in (-999, r.bseg_id)
+            and nvl(sf.i_bstp_id,-999) in (-999, r.bstp_id)
+            and sf.start_date <= last_day(r.bill_month)+1-1/24/60/60
+            and sf.end_date > last_day(r.bill_month)+1-1/24/60/60
+            ) o_zakaz,
+            (
+            select
+                max(sf1.o_pfm) keep (dense_rank first order by sf1.i_fs_id, sf1.i_brnc_id, sf1.i_bseg_id, sf1.i_bstp_id)
+            from
+                m_sap_financial sf1
+            where
+            --sf1.filial_id = r.filial_id
+                nvl(sf1.i_fs_id,-999) in (-999, r.fs_fs_id)
+            and nvl(sf1.i_brnc_id,-999) in (-999, r.brnc_id)
+            and nvl(sf1.i_bseg_id,-999) in (-999, r.bseg_id)
+            and nvl(sf1.i_bstp_id,-999) in (-999, r.bstp_id)
+            and sf1.start_date <= last_day(r.bill_month)+1-1/24/60/60
+            and sf1.end_date > last_day(r.bill_month)+1-1/24/60/60
+            ) o_pfm
+         from
+            agg r
+        ) r1
+        group by
+                    r1.filial_id,
+                    r1.bill_month,
+                    r1.bill_date,
+                    r1.sap_code,
+                    r1.acc_charges,
+                    r1.o_zakaz,
+                    r1.o_pfm,
+                    r1.acc_acc_id,
+                    r1.fs_fs_id,
+                    r1.is_vat,
+                    r1.divn_id,
+                    r1.bstp_id,
+                    r1.currency_id,
+                    r1.prcl_id,
+                    r1.fuct_date,
+                    r1.CTYP_ID,
+                    r1.BUKRS
+        ) r2
+        ) r3,
+
+          m_sap_accounts sa,
+          vl_stg.mss_broadband_curr_exchange cur
+        where
+            1=1
+            --and sa.filial_id = r3.filial_id
+            and nvl(sa.i_fs_id,r3.fs_fs_id) = r3.fs_fs_id
+            and nvl(sa.i_acc_id,r3.acc_acc_id) = r3.acc_acc_id
+            and nvl(sa.i_prcl_id,r3.prcl_id) = r3.prcl_id
+            and nvl(sa.i_divn_id,r3.divn_id) = r3.divn_id
+            and sa.start_date <= last_day(r3.bill_month)+1-1/24/60/60
+            and sa.end_date >= last_day(r3.bill_month)+1-1/24/60/60
+
+
+            and cur.curr_curr_id (+) = r3.currency_id
+            and cur.rate_date (+) = last_day(r3.fuct_date)
+        ;
+        r := sql%ROWCOUNT;
+        commit;
+
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_salebook',in_rows_processed => r);
+
+
+        -- SAP выгрузка ТО
+        insert /*+ append parallel(8) */
+        into F_SAP_SALES_MONTHLY_TMP
+        (
+            FILIAL_ID,
+            BILL_MONTH,
+            DID,
+            date1,
+            DATE2,
+            BUKRS,
+            TYPE2,
+            DTIP,
+            TEXT,
+            CURR,
+            DEBITOR,
+            POS_NUM,
+            INN,
+            FS,
+            PFM,
+            KP,
+            TAXCODE,
+            ZAKAZ,
+            TEXT1,
+            NALOG,
+            PROJK,
+            XREF1,
+            RED,
+            SUMM_DOC,
+            SUMM_R,
+            SUMM_D,
+            CNT_TO,
+            ACOUNT_TYPE,
+            CLIENT_TYPE,
+            INV_NUMBER,
+            INV_DATE,
+            TRUE_FACT_DATE
+        )
+        with agg as (
+                select /*+parallel(8) materialize*/
+                    t.filial_id,
+                    t.bill_month,
+                    t.bill_date,
+                    case when sc.acc_charges in (62020090,62030090) then null
+                         else sc.sap_code
+                    end sap_code,
+                    sc.acc_charges,
+                    t.fs_fs_id,
+                    t.brnc_id,
+                    t.bseg_id,
+                    t.bstp_id,
+                    t.acc_acc_id,
+                    t.is_vat,
+                    t.divn_id,
+                    sc.currency_id,
+                    sum(t.amount_all) amount_all,
+                    sum(t.vat) vat,
+                    sum(t.amount) amount,
+                    t.prcl_id,
+                    sum(t.cnt_to) cnt_to,
+                    t.fuct_date,
+                    t.CTYP_ID,
+                    t.inv_number,
+                    t.inv_date,
+                    t.TRUE_FACT_DATE,
+                    f.sap_code BUKRS
+                from F_SAP_CLNT_SALES_MONTHLY_TMP t,
+                     d_sap_clients sc,
+                     pub_ds.d_filials f
+                where
+                    1=1
+                    --and sc.filial_id=t.filial_id
+                    and sc.sap_clnt_id=t.sap_clnt_id
+
+                    and t.acount_type=3 -- ТО
+                    and t.filial_id = f.filial_id
+                group by
+                    t.filial_id,
+                    --t.acount_type,
+                    t.bill_month,
+                    t.bill_date,
+                    case when sc.acc_charges in (62020090,62030090) then null
+                         else sc.sap_code
+                    end,
+                    sc.acc_charges,
+                    t.fs_fs_id,
+                    t.brnc_id,
+                    t.bseg_id,
+                    t.bstp_id,
+                    t.acc_acc_id,
+                    t.is_vat,
+                    t.divn_id,
+                    sc.currency_id,
+                    t.prcl_id,
+                    t.fuct_date,
+                    t.CTYP_ID,
+                    t.inv_number,
+                    t.inv_date,
+                    t.TRUE_FACT_DATE,
+                    f.sap_code
+        )
+        select
+            r3.filial_id,
+            r3.bill_month,
+            case when r3.filial_id = 8 then r3.inv_number
+              else r3.DID end DID,
+            case when r3.filial_id = 8 then r3.TRUE_FACT_DATE
+              else r3.bill_date end DATE1,
+            r3.fuct_date DATE2,
+            r3.BUKRS,
+            case when r3.is_vat=0 then 'NVAT'
+                 when r3.bstp_id in (2,3) then 'FIXI'
+                 else 'RUBL'
+            end TYPE2,
+            case when r3.is_vat=0 then 'd6'
+                 else 'd1'
+            end DTIP,
+            case when r3.is_vat=0 then 'Реализация без НДС'
+                 else 'Реализация коммерческ.'
+            end TEXT,
+            case when nvl(r3.currency_id,1)=1 then 'RUB'
+                 when nvl(r3.currency_id,1)=2 then 'USD'
+                 when nvl(r3.currency_id,1)=3 then 'EUR'
+            end CURR,
+            trim(r3.sap_code) DEBITOR,
+            case when sa.o_acc like '62%' then 1
+                 when sa.o_acc like '90%' and sa.o_fs not in ('99','502','602') then 2
+                 when instr(sa.o_acc,'2')=5 then 4
+                 when sa.o_acc like '90%' and sa.o_fs in ('99','502','602') then 3
+                 when sa.o_acc like '68%' and sa.o_fs in ('99','502','602') then 5
+            end POS_NUM,
+            case when trim(sa.o_acc) = '62' then r3.acc_charges
+                 else sa.o_acc
+            end INN,
+            case when sa.o_acc like '62%' and trim(r3.sap_code) is not null then 602
+                     when sa.o_acc like '62%' and trim(r3.sap_code) is null then 502
+                     else sa.o_fs
+            end FS,
+            r3.o_pfm PFM,
+            case when r3.amount_all<0 and sa.o_kp ='40' then '50'
+                     when r3.amount_all<0 and sa.o_kp ='50' then '40'
+                     --when r3.amount_all<0 and sa.o_kp ='01' then '11'
+                 else sa.o_kp
+            end KP,
+            case when sa.o_acc like '68%' then sa.o_taxcode
+                     else null
+            end TAXCODE,
+            case when sa.o_acc like '90%' and sa.o_fs not in ('99','502','602') then r3.o_zakaz
+                 else null
+            end ZAKAZ,
+            sa.o_text1 TEXT1,
+            sa.o_nalog NALOG,
+            sa.projk PROJK,
+            cast(null as VARCHAR2(50)) XREF1,
+            case when r3.amount_all<0 then 'X'
+                 else null
+            end RED,
+            r3.amount_all * nvl(sa.o_is_amount, 0) +  r3.vat * nvl(sa.o_is_amount_vat, 0) + r3.amount * nvl(sa.o_is_amount_wo_vat, 0) SUMM_DOC,
+            round((r3.amount_all * nvl(sa.o_is_amount, 0) +  r3.vat * nvl(sa.o_is_amount_vat, 0) + r3.amount * nvl(sa.o_is_amount_wo_vat, 0)) * nvl(cur.rate,1),2) SUMM_R,
+            0 SUMM_D,
+            r3.cnt_to,
+            3 acount_type,
+            (select def from bis_client_types ct where ct.ctyp_id = r3.ctyp_id) client_type,
+            r3.inv_number,
+            r3.inv_date,
+            r3.TRUE_FACT_DATE
+        from
+        (
+
+        select
+            r2.DID_TEXT || ROW_NUMBER() over (partition by r2.DID_TEXT order by r2.acc_acc_id) did,
+            r2.*
+        from
+
+        (
+
+        select
+            'TO_' DID_TEXT,
+            r1.filial_id,
+            r1.bill_month,
+            r1.bill_date,
+            r1.sap_code,
+            r1.acc_charges,
+            r1.o_zakaz,
+            r1.o_pfm,
+            r1.acc_acc_id,
+            r1.fs_fs_id,
+            r1.is_vat,
+            r1.divn_id,
+            r1.bstp_id,
+            r1.currency_id,
+            sum(r1.amount_all) amount_all,
+            sum(r1.vat) vat,
+            sum(r1.amount) amount,
+            r1.prcl_id,
+            sum(r1.cnt_to) cnt_to,
+            r1.fuct_date,
+            r1.CTYP_ID,
+            r1.inv_number,
+            r1.inv_date,
+            r1.TRUE_FACT_DATE,
+            r1.BUKRS
+        from
+        (
+        select
+            r.*,
+            (
+            select
+                max(sf.o_zakaz) keep (dense_rank first order by sf.i_fs_id, sf.i_brnc_id, sf.i_bseg_id, sf.i_bstp_id)
+            from
+                m_sap_financial sf
+            where
+            --sf.filial_id = r.filial_id
+                nvl(sf.i_fs_id,-999) in (-999, r.fs_fs_id)
+            and nvl(sf.i_brnc_id,-999) in (-999, r.brnc_id)
+            and nvl(sf.i_bseg_id,-999) in (-999, r.bseg_id)
+            and nvl(sf.i_bstp_id,-999) in (-999, r.bstp_id)
+            and sf.start_date <= last_day(r.bill_month)+1-1/24/60/60
+            and sf.end_date > last_day(r.bill_month)+1-1/24/60/60
+            ) o_zakaz,
+            (
+            select
+                max(sf1.o_pfm) keep (dense_rank first order by sf1.i_fs_id, sf1.i_brnc_id, sf1.i_bseg_id, sf1.i_bstp_id)
+            from
+                m_sap_financial sf1
+            where
+            --sf1.filial_id = r.filial_id
+                nvl(sf1.i_fs_id,-999) in (-999, r.fs_fs_id)
+            and nvl(sf1.i_brnc_id,-999) in (-999, r.brnc_id)
+            and nvl(sf1.i_bseg_id,-999) in (-999, r.bseg_id)
+            and nvl(sf1.i_bstp_id,-999) in (-999, r.bstp_id)
+            and sf1.start_date <= last_day(r.bill_month)+1-1/24/60/60
+            and sf1.end_date > last_day(r.bill_month)+1-1/24/60/60
+            ) o_pfm
+         from
+            agg r
+        ) r1
+        group by
+                    r1.filial_id,
+                    r1.bill_month,
+                    r1.bill_date,
+                    r1.sap_code,
+                    r1.acc_charges,
+                    r1.o_zakaz,
+                    r1.o_pfm,
+                    r1.acc_acc_id,
+                    r1.fs_fs_id,
+                    r1.is_vat,
+                    r1.divn_id,
+                    r1.bstp_id,
+                    r1.currency_id,
+                    r1.prcl_id,
+                    r1.fuct_date,
+                    r1.CTYP_ID,
+                    r1.inv_number,
+                    r1.inv_date,
+                    r1.TRUE_FACT_DATE,
+                    r1.BUKRS
+        ) r2
+        ) r3,
+
+          m_sap_accounts sa,
+          vl_stg.mss_broadband_curr_exchange cur
+        where
+            1=1
+            --and sa.filial_id = r3.filial_id
+            and nvl(sa.i_fs_id,r3.fs_fs_id) = r3.fs_fs_id
+            and nvl(sa.i_acc_id,r3.acc_acc_id) = r3.acc_acc_id
+            and nvl(sa.i_prcl_id,r3.prcl_id) = r3.prcl_id
+            and nvl(sa.i_divn_id,r3.divn_id) = r3.divn_id
+            and sa.start_date <= last_day(r3.bill_month)+1-1/24/60/60
+            and sa.end_date >= last_day(r3.bill_month)+1-1/24/60/60
+
+
+            and cur.curr_curr_id (+) = r3.currency_id
+            and cur.rate_date (+) = last_day(r3.fuct_date)
+        ;
+
+        r := sql%ROWCOUNT;
+        commit;
+
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_salebook_to',in_rows_processed => r);
+
+    --    partition_move (v_sdate);
+/*
+        dbms_stats.gather_table_stats(user, 'F_SAP_CLNT_SALES_MONTHLY_TMP', estimate_percent => 1, degree => 10);
+        if user != 'SB_DEV' then
+            PUB_DS.MOVE.LOAD(USER || '.F_SAP_CLNT_SALES_MONTHLY_TMP', v_sdate);
+        end if;
+
+        dbms_stats.gather_table_stats(user, 'F_SAP_SALES_MONTHLY_TMP', estimate_percent => 1, degree => 10);
+        if user != 'SB_DEV' then
+            PUB_DS.MOVE.LOAD(USER || '.F_SAP_SALES_MONTHLY_TMP', v_sdate);
+        end if;
+*/
+      EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK;
+            pub_ds.job_log.write_detail_log(in_comment_text => 'load_salebook: ' || v_sdate || ' ' || SUBSTR (SQLERRM, 1, 1800),in_rows_processed => r);
+      RAISE;
+  END;
+
+procedure load_salebook_add_report
+(
+    in_filial_id  number,
+    in_month_date in date
+) is
+    sd_ date := in_month_date;
+    ed_ date := last_day(sd_) + 1;
+    cd_ date := last_day(sd_);
+begin
+
+    pub_ds.job_log.write_detail_log(in_comment_text => 'start load_salebook_add_report');
+
+    execute immediate 'truncate table f_ajmt_salebook_monthly_temp';
+    execute immediate 'truncate table f_sap_salebook_okn_headers_tmp';
+    execute immediate 'truncate table f_sap_salebook_okn_details_tmp';
+
+    insert /*+ append parallel(8)*/
+    into f_ajmt_salebook_monthly_temp(BILL_MONTH,FUCT_DATE,BILL_ID,CLNT_CLNT_ID,BLTP_BLTP_ID,BSTP_BSTP_ID,AMOUNT_ALL,AJTP_AJTP_ID,SAP_CLNT_ID,IS_UNLOADED,FILIAL_ID)
+        select /*+ dynamic_sampling(b 6) parallel(8)*/
+        --row_number() over (order by to_date(t.bill_month, 'dd.mm.yyyy'), t.fuct_date) id,
+         last_day(in_month_date) bill_month,
+         case
+             when fp.fisc_end_date is null or nvl(sc.jrtp_jrtp_id, 1) != 2 then
+              last_day(in_month_date) --
+             else
+              last_day(trunc(fp.fisc_end_date))
+         end fuct_date,
+         b.BILL_ID,
+         b.CLNT_CLNT_ID,
+         b.bltp_bltp_id,
+         sc.bstp_bstp_id,
+         a.AMOUNT_$ amount_all,
+         a.AJTP_AJTP_ID,
+         (select --+index(MSC IU_M_SAP_CLIENTS)
+           max(msc.o_sap_clnt_id) keep(dense_rank first order by msc.i_clnt_id, msc.i_ctyp_ctyp_id, msc.i_jrtp_id, msc.i_clcl_id, msc.i_ccat_id, msc.i_is_vat, msc.I_BSTP_ID, msc.I_MASTER_SEGMENT_ID)
+          from   M_SAP_CLIENTS msc
+          where  nvl(msc.i_clnt_id, -999) in (-999, sc.clnt_clnt_id)
+          and    nvl(msc.i_ctyp_ctyp_id, -999) in (-999, sc.ctyp_ctyp_id)
+          and    nvl(msc.i_ccat_id, -999) in (-999, sc.ccat_ccat_id)
+          and    nvl(msc.i_is_vat, -999) in (-999, sc.is_vat)
+          and    nvl(msc.i_clcl_id, -999) in (-999, sc.clcl_clcl_id)
+          and    nvl(msc.i_jrtp_id, -999) in (-999, sc.jrtp_jrtp_id)
+          and    nvl(msc.i_bstp_id, -999) in (-999, sc.BSTP_BSTP_ID)
+          and    nvl(msc.I_MASTER_SEGMENT_ID, -999) in (-999, sc.MASTER_SEGMENT_ID)
+          and    msc.i_is_to is null -- не ТО
+          and    msc.start_date <= last_day(in_month_date)
+          and    msc.end_date >= last_day(in_month_date)) SAP_CLNT_ID,
+         case
+             when ex.clnt_clnt_id is not null then
+              0 -- Исключенец, не берем
+             when sc.MASTER_SEGMENT_ID <= 0 then
+              0 -- некоммерческий, не берем
+             else
+              1 -- по умолчанию остальных включаем в выгрузку
+         end is_unloaded,
+         sc.filial_id
+        from   bis_bills b,
+               bis_bill_cycles bc,
+               F_SAP_SALES_EX_TMP ex,
+               bis_adjustments a,
+               BIS_FISCAL_PERIODS fp,
+               (select case
+                           when ct.clnt_clnt_id is not null then
+                            1
+                           else
+                            0
+                       end is_vat,
+                       sc1.*
+                from   s_clients        sc1,
+                       bis_client_Taxes ct
+                where  sc1.snap_date = last_day(in_month_date)
+                and    sc1.FILIAL_ID = nvl(in_filial_id, sc1.FILIAL_ID)
+                and    ct.clnt_clnt_id(+) = sc1.clnt_clnt_id
+                and    ct.start_date(+) <= last_day(in_month_date) + 1 - 1 / 24 / 60 / 60
+                and    ct.end_date(+) > last_day(in_month_date) + 1 - 1 / 24 / 60 / 60
+                and    ct.tax_tax_id(+) = 1) sc
+        /*,
+        PUB_DS.D_SAP_UMSKZ ums_deb,
+        PUB_DS.D_SAP_UMSKZ ums_cred*/
+        where  b.bill_date >= sd_
+        and    b.bill_date < ed_
+        and    sc.snap_date = cd_
+        and    b.BLCL_BLCL_ID = bc.blcl_id
+        and    b.CLNT_CLNT_ID = sc.clnt_clnt_id
+        and    b.CLNT_CLNT_ID = ex.clnt_clnt_id(+)
+        and    a.BILL_BILL_ID = b.bill_id
+        and    a.DEL_DATE is null
+        and    a.fisp_fisp_id = fp.FISP_ID(+);
+    commit;
+
+    insert all when dest = 'header' then into f_sap_salebook_okn_headers_tmp
+        (id,
+         budat,
+         bldat,
+         blart,
+         waers,
+         bktxt,
+         bukrs,
+         xblnr)
+    values
+        (id,
+         budat,
+         bldat, -- budat
+         'AE',
+         'RUB', -- waers
+         'Рекласс  ДЗ -> Авансы по ОКН', --bktxt
+         bukrs,
+         '' -- xblnr
+         ) when dest = 'detail s' then into f_sap_salebook_okn_details_tmp
+        (id,
+         buzei,
+         bschl,
+         newko,
+         hkont,
+         zuonr,
+         wrbtr,
+         dmbtr,
+         fistl,
+         xref1,
+         xref3,
+         fkber_long,
+         umskz,
+         mwskz,
+         sgtxt)
+    values
+        (id,
+         buzei,
+         'S',
+         newko_deb,
+         acc_payments_deb,
+         zuonr_deb,
+         amount /** nvl(rate, 1)*/,
+         amount,
+         fistl_deb,
+         '',
+         '',
+         fkber_long_deb,
+         umskz_deb,
+         mwskz_deb,
+         sgtxt_deb) when dest = 'detail h' then into f_sap_salebook_okn_details_tmp
+        (id,
+         buzei,
+         bschl,
+         newko,
+         hkont,
+         zuonr,
+         wrbtr,
+         dmbtr,
+         fistl,
+         xref1,
+         xref3,
+         fkber_long,
+         umskz,
+         mwskz,
+         sgtxt)
+    values
+        (id,
+         buzei,
+         'H',
+         newko_cred,
+         acc_payments_cred,
+         zuonr_cred,
+         amount /* * nvl(rate, 1)*/,
+         amount,
+         fistl_cred,
+         '',
+         '',
+         fkber_long_cred,
+         umskz_cred,
+         mwskz_cred,
+         sgtxt_cred)
+        with
+
+        agg as
+         (select /*+parallel(8) materialize*/row_number() over(order by to_date(t.bill_month, 'dd.mm.yyyy'), t.fuct_date) id,
+                 t.bill_month budat,
+                 t.fuct_date bldat,
+                 --sc.BKTXT,
+                 sc.ACC_CHARGES ACC_PAYMENTS_DEB,
+                 sc.ACC_ADVANCES ACC_PAYMENTS_CRED,
+                 sc.SAP_CODE NEWKO_DEB,
+                 sc.SAP_CODE NEWKO_CRED, -- newko2 ?
+                 sc.FISTL FISTL_DEB,
+                 sc.FISTL FISTL_CRED,
+                 sc.FKBER_LONG FKBER_LONG_DEB,
+                 sc.FKBER_LONG FKBER_LONG_CRED,
+                 sc.SAP_PAY_CODE ZUONR_DEB,
+                 sc.SAP_PAY_CODE ZUONR_CRED,
+                 sc.MWSKZ_DEB MWSKZ_DEB,
+                 sc.MWSKZ_CRED MWSKZ_CRED,
+                 sc.SGTXT SGTXT_DEB,
+                 sc.SGTXT SGTXT_CRED,
+                 ums_deb.umskz UMSKZ_DEB,
+                 ums_cred.umskz UMSKZ_CRED,
+                 abs(sum(t.amount_all)) amount,
+                 sc.currency_id,
+                 f.sap_code BUKRS
+          from   f_ajmt_salebook_monthly_temp t,
+
+                 d_sap_clients      sc,
+                 PUB_DS.D_SAP_UMSKZ ums_deb,
+                 PUB_DS.D_SAP_UMSKZ ums_cred,
+                 pub_ds.d_filials f
+          where  t.SAP_CLNT_ID = sc.SAP_clnt_id
+          and    t.ajtp_ajtp_id = 3
+          and    t.is_unloaded = 1
+          and    t.amount_all < 0
+          and    sc.ACC_CHARGES = ums_deb.account(+)
+          and    sc.ACC_ADVANCES = ums_cred.account(+)
+          and    t.filial_id = f.filial_id
+          group  by t.bill_month,
+                    t.fuct_date,
+                    --sc.BKTXT,
+                    sc.ACC_CHARGES,
+                    sc.ACC_ADVANCES,
+                    sc.SAP_CODE,
+                    sc.SAP_CODE, -- newko2 ?
+                    sc.FISTL,
+                    sc.FISTL,
+                    sc.FKBER_LONG,
+                    sc.FKBER_LONG,
+                    sc.SAP_PAY_CODE,
+                    sc.SAP_PAY_CODE,
+                    sc.MWSKZ_DEB,
+                    sc.MWSKZ_CRED,
+                    sc.SGTXT,
+                    sc.SGTXT,
+                    ums_deb.umskz,
+                    ums_cred.umskz,
+                    sc.currency_id,
+                    f.sap_code
+
+          )
+
+        select 0 buzei,
+               '' mwskz,
+               'header' dest,
+               agg.*
+        from   agg
+        union all
+        select row_number() over(partition by t.id order by mwskz nulls first, dest desc) buzei,
+               t.*
+        from   (select mwskz_cred mwskz,
+                       'detail h' dest,
+                       agg.*
+                from   agg
+                union all
+                select mwskz_deb mwskz,
+                       'detail s' dest,
+                       agg.*
+                from   agg) t;
+    commit;
+
+    pub_ds.job_log.write_detail_log(in_comment_text => 'end load_salebook_add_report');
+
+exception
+    when others then
+        rollback;
+        pub_ds.job_log.write_detail_log(in_comment_text => 'load_salebook: ' || SUBSTR(sqlerrm, 1, 1800));
+        raise;
+end;
+
+
+procedure checks(in_month_date IN date)
+is
+    cnt number;
+begin
+
+    select count(1) into cnt
+    from   (select did,
+                   sum(sum_kp) dif_sum
+            from   (select t.did,
+                           kp,
+                           case
+                               when kp = 50 then
+                                -sum(t.summ_doc)
+                               else
+                                sum(t.summ_doc)
+                           end sum_kp
+                    from   F_SAP_SALES_MONTHLY t
+                    where  t.bill_month = trunc(in_month_date, 'mm')
+                    group  by did,
+                              kp) t
+            group  by did)
+    where  dif_sum != 0;
+
+    if (cnt != 0) then
+      pub_ds.job_log.write_detail_log(in_comment_text => 'DT != KT check: select in package f_sap_sales_monthly (procedure checks)');
+    end if;
+
+end;
+
+  PROCEDURE load (in_filial_id NUMBER, in_month_date IN VARCHAR2) IS
+    v_date DATE;
+    v_lockhandle NUMBER;
+    v_lock_release NUMBER;
+    e_cancelled exception;
+    sd_ date := to_date(in_month_date, 'yyyymmdd');
+    ed_ date := last_day(sd_) + 1;
+    cd_ date := last_day(sd_);
+    PRAGMA EXCEPTION_INIT (e_cancelled, -1013);
+
+  BEGIN
+    v_date := TO_DATE (in_month_date, 'yyyymmdd');
+
+        pub_ds.job_log.start_log(in_filial_id => in_filial_id, in_procedure_name => 'f_sap_salebook_monthly_upl',in_comment_text => 'load begin: ' || in_month_date);
+
+        -- выставляем блокировку, чтобы запретить вызов пакета для данного филиала в другом процессе
+        DBMS_LOCK.allocate_unique (lockname => USER || '_' || $$plsql_unit, lockhandle => v_lockhandle);
+
+        -- ждём, пока блокировка не будет снята
+        WHILE DBMS_LOCK.request (lockhandle => v_lockhandle) <> 0
+        LOOP
+           DBMS_LOCK.sleep (60);
+        END LOOP;
+
+        EXECUTE IMMEDIATE 'alter session enable parallel dml';
+        load_exceptions(in_filial_id, ed_, cd_);
+        load_data_fucturies(in_filial_id, v_date);-- счет фактуры
+     --   partition_create ('f_clnt_salebook_monthly', 'SAP_CL_SALEBOOK', in_month_date);
+        load_data_bills (in_filial_id, v_date); --данные по bills
+        if in_filial_id in (1, 8) then load_single_charges (in_filial_id, v_date); end if;--Разовые счета СтФ
+        -- т.к. в ДвФ разовые начисления - это ТО, переносим их в ТО
+        if in_filial_id = 8 then
+                    update F_SAP_CLNT_SALES_MONTHLY_TMP t
+                    set t.acount_type=3
+                    where t.acount_type=2;
+                    commit;
+        end if;
+
+        if in_filial_id = 6 then load_to (in_filial_id, v_date); end if;--ТО СФ
+
+
+        load_fuct_prev_period (in_filial_id, v_date); --корректировки предыдущих периодов
+
+        load_delta_fucturies_bill_det(v_date);--корректировка сумм согласно счет-фактурам (обычно НДС)
+
+      --  partition_create ('F_SAP_SALEBOOK_MONTHLY', 'SAP_SALEBOOK', in_month_date);
+         load_salebook (v_date); --выгрузка в SAP
+         if in_filial_id = 8 then
+                    update F_SAP_SALES_MONTHLY_TMP t
+                    set t.DTIP = 'd8'
+                    where t.bill_month = trunc(v_date,'MM') and t.acount_type = 3;
+                    commit;
+        end if;
+
+        load_salebook_add_report(in_filial_id, v_date);
+
+        checks(v_date);
+
+        dbms_stats.gather_table_stats(user, 'F_SAP_CLNT_SALES_MONTHLY_TMP', estimate_percent => 1, degree => 10);
+        if user != 'SB_DEV' then
+            PUB_DS.MOVE.LOAD(USER || '.F_SAP_CLNT_SALES_MONTHLY_TMP', to_char(v_date,'YYYYMMDD'));
+        end if;
+
+        dbms_stats.gather_table_stats(user, 'F_SAP_SALES_MONTHLY_TMP', estimate_percent => 1, degree => 10);
+        if user != 'SB_DEV' then
+            PUB_DS.MOVE.LOAD(USER || '.F_SAP_SALES_MONTHLY_TMP', to_char(v_date,'YYYYMMDD'));
+        end if;
+
+      -- Снимаем блокировку
+      v_lock_release := DBMS_LOCK.release (lockhandle => v_lockhandle);
+
+      pub_ds.job_log.end_log();
+   EXCEPTION
+      WHEN e_cancelled THEN
+         -- Снимаем блокировку
+         v_lock_release := DBMS_LOCK.release (lockhandle => v_lockhandle);
+         --pub_ds.job_log.end_log_with_error (in_error => SUBSTR (SQLERRM, 1, 1800));
+         pub_ds.job_log.end_log_with_error (in_error => SUBSTR (SQLERRM, 1, 1800)||
+         Chr(13)|| Chr(10) || 'ORACLE BACKTRACE:  '|| dbms_utility.format_error_backtrace());
+         RAISE;
+      WHEN OTHERS THEN
+         -- Снимаем блокировку
+         v_lock_release := DBMS_LOCK.release (lockhandle => v_lockhandle);
+         --pub_ds.job_log.end_log_with_error (in_error => SUBSTR (SQLERRM, 1, 1800));
+         pub_ds.job_log.end_log_with_error (in_error => SUBSTR (SQLERRM, 1, 1800)||
+         Chr(13)|| Chr(10) || 'ORACLE BACKTRACE:  '|| dbms_utility.format_error_backtrace());
+      RAISE;
+  END;
+
+END f_sap_salebook_monthly_upl;
